@@ -4,6 +4,6 @@ numpy  >= 1.16
 scipy  >= 1.12
 Cython >= 0.25, < 3.0
 mpi4py >= 3.0.0, < 4
-
-# Required to build h5py from source
-pkgconfig
+h5py
+# IGAKIT - not on PyPI
+https://github.com/dalcinl/igakit/archive/refs/heads/master.zip

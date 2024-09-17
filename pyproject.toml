@@ -24,7 +24,7 @@ dependencies = [
     # Third-party packages from PyPi
     'numpy >= 1.16',
     'scipy >= 1.12',
-    'sympy >= 1.5',
+    'sympy>=1.5, <1.7',
     'matplotlib',
     'pytest >= 4.5',
     'pytest-xdist >= 1.16',
