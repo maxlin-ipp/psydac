@@ -25,51 +25,6 @@ __all__ = (
     'GMRES',
 )
 
-
-def _gpu_vector_data(vector):
-    """Return the writable arrays of a device vector, including blocks."""
-    if hasattr(vector, "blocks"):
-        arrays = []
-        for block in vector.blocks:
-            block_arrays = _gpu_vector_data(block)
-            if block_arrays is not None:
-                arrays.extend(block_arrays)
-        return arrays if arrays else None
-    data = getattr(vector, "_data", None)
-    if data is None or not xp.is_gpu(data):
-        return None
-    arrays = [data]
-    for value in getattr(vector, "_interface_data", {}).values():
-        arrays.append(value)
-    return arrays
-
-
-def _gpu_assign2(out, left, alpha, right, beta):
-    """Set ``out = alpha*left + beta*right`` in fused device operations."""
-    if hasattr(out, "blocks"):
-        for oo, ll, rr in zip(out.blocks, left.blocks, right.blocks):
-            _gpu_assign2(oo, ll, alpha, rr, beta)
-        out._sync = left._sync and right._sync
-        return
-    out._data[...] = alpha * left._data + beta * right._data
-    for key in getattr(out, "_interface_data", {}):
-        out._interface_data[key][...] = alpha * left._interface_data[key] + beta * right._interface_data[key]
-    out._sync = left._sync and right._sync
-
-
-def _gpu_assign3(out, left, alpha, middle, beta, right, gamma):
-    """Set ``out = alpha*left + beta*middle + gamma*right`` fused."""
-    if hasattr(out, "blocks"):
-        for oo, ll, mm, rr in zip(out.blocks, left.blocks, middle.blocks, right.blocks):
-            _gpu_assign3(oo, ll, alpha, mm, beta, rr, gamma)
-        out._sync = left._sync and middle._sync and right._sync
-        return
-    out._data[...] = alpha * left._data + beta * middle._data + gamma * right._data
-    for key in getattr(out, "_interface_data", {}):
-        out._interface_data[key][...] = alpha * left._interface_data[key] + beta * middle._interface_data[key] + gamma * right._interface_data[key]
-    out._sync = left._sync and middle._sync and right._sync
-
-
 #===============================================================================
 def inverse(A, solver, **kwargs):
     """
@@ -399,12 +354,10 @@ class PConjugateGradient(InverseLinearOperator):
         # First values
         A.dot(x, out=v)
         b.copy(out=r)
-        r -= v
+        r       -= v
+        nrmr_sqr = r.inner(r).real
         pc.dot(r, out=s)
-        # (r, r) and (s, r) are reduced together: one collective and, on a GPU
-        # backend, one device-to-host synchronization instead of two.
-        nrmr_sqr, am = r.space.inner_many((r, r), (s, r))
-        nrmr_sqr = nrmr_sqr.real
+        am       = s.inner(r)
         s.copy(out=p)
 
         tol_sqr  = tol**2
@@ -430,13 +383,10 @@ class PConjugateGradient(InverseLinearOperator):
             x.mul_iadd(l, p) # this is x += l*p
             r.mul_iadd(-l, v) # this is r -= l*v
 
+            nrmr_sqr = r.inner(r).real
             pc.dot(r, out=s)
 
-            # As above, the residual norm rides along in the reduction that the
-            # recurrence needs anyway, so the convergence criterion stays the
-            # Euclidean one and costs no extra collective.
-            nrmr_sqr, am1 = r.space.inner_many((r, r), (s, r))
-            nrmr_sqr = nrmr_sqr.real
+            am1 = s.inner(r)
 
             # we are computing p = (am1 / am) * p + s by using axpy on s and exchanging the arrays
             s.mul_iadd((am1/am), p)
@@ -945,7 +895,6 @@ class PBiConjugateGradientStabilized(InverseLinearOperator):
         assert b.space is domain
 
         assert isinstance(pc, LinearOperator)
-        gpu_mode = _gpu_vector_data(b) is not None
 
         # first guess of solution
         if out is not None:
@@ -988,25 +937,20 @@ class PBiConjugateGradientStabilized(InverseLinearOperator):
 
         # first values: r = b - A @ x, rp = pp = PC @ r, rhop = |rp|^2
         A.dot(x, out=v)
-        if gpu_mode:
-            _gpu_assign2(r, b, 1.0, v, -1.0)
-        else:
-            b.copy(out=r)
-            r -= v
+        b.copy(out=r)
+        r -= v
 
         pc.dot(r, out=rp)
         rp.copy(out=pp)
+
+        rhop = rp.inner(rp)
 
         # save initial residual vector rp0
         rp0 = self._tmps['rp0']
         rp.copy(out=rp0)
 
-        # Batch the initial reductions.  On a device backend this avoids a
-        # second stream synchronization for the residual norm.
-        rhop, res_sqr = domain.inner_many((rp, rp), (r, r))
-
         # squared residual norm and squared tolerance
-        res_sqr = res_sqr.real
+        res_sqr = r.inner(r).real
         tol_sqr = tol**2
 
         if verbose:
@@ -1024,49 +968,36 @@ class PBiConjugateGradientStabilized(InverseLinearOperator):
             # v = A @ pp, vp = PC @ v, alphap = rhop/(vp.rp0)
             A.dot(pp, out=v)
             pc.dot(v, out=vp)
-            # Keep the scalar reductions on one collective/synchronization.
-            alpha_den, = domain.inner_many((vp, rp0))
-            alphap = rhop / alpha_den
+            alphap = rhop / vp.inner(rp0)
 
             # s = r - alphap*v, sp = PC @ s
-            if gpu_mode:
-                _gpu_assign2(s, r, 1.0, v, -alphap)
-            else:
-                r.copy(out=s)
-                v.copy(out=av)
-                av *= alphap
-                s -= av
+            r.copy(out=s)
+            v.copy(out=av)
+            av *= alphap
+            s -= av
             pc.dot(s, out=sp)
 
             # t = A @ sp, tp = PC @ t, omegap = (tp.sp)/(tp.tp)
             A.dot(sp, out=t)
             pc.dot(t, out=tp)
-            omega_num, omega_den = domain.inner_many((tp, sp), (tp, tp))
-            omegap = omega_num / omega_den
+            omegap = tp.inner(sp) / tp.inner(tp)
 
             # x = x + alphap*pp + omegap*sp
-            if gpu_mode:
-                _gpu_assign3(x, x, 1.0, pp, alphap, sp, omegap)
-            else:
-                pp.copy(out=app)
-                sp.copy(out=osp)
-                app *= alphap
-                osp *= omegap
-                x += app
-                x += osp
+            pp.copy(out=app)
+            sp.copy(out=osp)
+            app *= alphap
+            osp *= omegap
+            x += app
+            x += osp
 
             # r = s - omegap*t, rp = sp - omegap*tp
-            if gpu_mode:
-                _gpu_assign2(r, s, 1.0, t, -omegap)
-                _gpu_assign2(rp, sp, 1.0, tp, -omegap)
-            else:
-                s.copy(out=r)
-                t *= omegap
-                r -= t
+            s.copy(out=r)
+            t *= omegap
+            r -= t
 
-                sp.copy(out=rp)
-                tp *= omegap
-                rp -= tp
+            sp.copy(out=rp)
+            tp *= omegap
+            rp -= tp
 
             # rhop_new = rp.rp0, betap = (alphap*rhop_new)/(omegap*rhop)
             rhop_new = rp.inner(rp0)
@@ -1074,13 +1005,10 @@ class PBiConjugateGradientStabilized(InverseLinearOperator):
             rhop = 1*rhop_new
 
             # pp = rp + betap*(pp - omegap*vp)
-            if gpu_mode:
-                _gpu_assign3(pp, rp, 1.0, pp, betap, vp, -betap * omegap)
-            else:
-                vp *= omegap
-                pp -= vp
-                pp *= betap
-                pp += rp
+            vp *= omegap
+            pp -= vp
+            pp *= betap
+            pp += rp
 
             # new residual norm
             res_sqr = r.inner(r).real
@@ -1969,9 +1897,7 @@ class GMRES(InverseLinearOperator):
         h = self._H[:k+2, k]
 
         for i in range(k):
-            # On CuPy, scalar indexing can retain a view into ``h``.  Keep a
-            # genuine scalar before modifying that entry in-place.
-            h_i_prev = h[i].item() if xp.is_gpu(h) else h[i]
+            h_i_prev = h[i]
 
             h[i] *= cn[i]
             h[i] += sn[i] * h[i+1]
@@ -1979,11 +1905,9 @@ class GMRES(InverseLinearOperator):
             h[i+1] *= cn[i]
             h[i+1] -= sn[i] * h_i_prev
         
-        h_k = h[k].item() if xp.is_gpu(h) else h[k]
-        h_k1 = h[k+1].item() if xp.is_gpu(h) else h[k+1]
-        mod = (h_k**2 + h_k1**2)**0.5
-        cn.append(h_k / mod)
-        sn.append(h_k1 / mod)
+        mod = (h[k]**2 + h[k+1]**2)**0.5
+        cn.append( h[k] / mod )
+        sn.append( h[k+1] / mod )
 
         h[k] *= cn[k]
         h[k] += sn[k] * h[k+1]

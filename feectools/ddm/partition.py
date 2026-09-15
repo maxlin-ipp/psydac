@@ -1,4 +1,5 @@
-import numpy as xp  # this module is host-only MPI/index bookkeeping, never device data
+import cunumpy as xp
+import numpy as np
 import numpy.ma as ma
 
 from sympy.ntheory import factorint

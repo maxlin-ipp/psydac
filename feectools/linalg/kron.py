@@ -1,7 +1,6 @@
 #coding = utf-8
 from functools import reduce
 
-import numpy as np
 import cunumpy as xp
 from scipy.sparse import kron
 from scipy.sparse import coo_matrix
@@ -114,10 +113,7 @@ class KroneckerStencilMatrix(LinearOperator):
             for jj in xp.ndindex(*pnrows):
                 i_mats = [mat._data[s, j] for s,j,mat in zip(xx, jj, mats)]
                 ii_jj = tuple(i+j+(s-1)*p for i,j,p,s in zip(ii, jj, pads, shifts))
-                # ``array_api_compat.cupy`` does not accept a Python list in
-                # ``prod``; multiplying the scalar factors also avoids a
-                # temporary device array in this innermost loop.
-                v += x._data[ii_jj] * reduce(lambda a, b: a * b, i_mats, 1)
+                v += x._data[ii_jj] * xp.prod(i_mats)
 
             out._data[xx] = v
 
@@ -155,7 +151,7 @@ class KroneckerStencilMatrix(LinearOperator):
         cols = key[self.ndim:]
         mats = self.mats
         elements = [A[i,j] for A,i,j in zip(mats, rows, cols)]
-        return reduce(lambda a, b: a * b, elements, 1)
+        return xp.prod(elements)
 
     def tostencil(self):
 
@@ -193,7 +189,7 @@ class KroneckerStencilMatrix(LinearOperator):
             for kk in xp.ndindex( *ndiags ):
 
                 values        = [mat[i,k] for mat,i,k in zip(mats, ii, kk)]
-                M[(*ii, *kk)] = reduce(lambda a, b: a * b, values, 1)
+                M[(*ii, *kk)] = xp.prod(values)
         
         # handle partly-multiplied rows
         new_nrows = nrows.copy()
@@ -216,7 +212,7 @@ class KroneckerStencilMatrix(LinearOperator):
 
                     for kk in xp.ndindex( *ndiags ):
                         values        = [mat[i,k] for mat,i,k in zip(mats, ii, kk)]
-                        M[(*ii, *kk)] = reduce(lambda a, b: a * b, values, 1)
+                        M[(*ii, *kk)] = xp.prod(values)
             new_nrows[d] += er
 
     def tosparse(self):
@@ -444,19 +440,15 @@ class KroneckerLinearSolver(LinearOperator):
         Computes the distribution of elements and sets up the solvers
         (which potentially utilize MPI).
         """
-        # slice sizes -- domain-decomposition bookkeeping (sizes/starts/ends),
-        # always host-resident regardless of the active array backend, matching
-        # self._domain.starts/ends (which are already plain host ints, see
-        # CartDecomposition in feectools.ddm.cart) and the MPI sizes/displacements
-        # computed from them below in KroneckerSolverParallelPass.
-        starts = np.array(self._domain.starts)
-        ends = np.array(self._domain.ends) + 1
+        # slice sizes
+        starts = xp.array(self._domain.starts)
+        ends = xp.array(self._domain.ends) + 1
         self._slice = tuple([slice(s, e) for s,e in zip(starts, ends)])
 
         # local and global sizes
         nglobals = self._domain.npts
         nlocals = ends - starts
-        self._localsize = np.prod(nlocals)
+        self._localsize = xp.prod(nlocals)
         mglobals = self._localsize // nlocals
         self._nlocals = nlocals
 
@@ -499,9 +491,7 @@ class KroneckerLinearSolver(LinearOperator):
 
         # we use a single permutation for all steps
         # it is: (n, 1, 2, ..., n-1)
-        # host bookkeeping (ndim-sized), like self._shapes/self._nlocals it
-        # indexes -- see the note on _setup_solvers above.
-        self._perm = np.arange(self._ndim)
+        self._perm = xp.arange(self._ndim)
         self._perm[1:] = self._perm[:-1]
         self._perm[0] = self._ndim - 1
 
@@ -589,33 +579,9 @@ class KroneckerLinearSolver(LinearOperator):
         """
         The internal solve loop. Can handle arbitrary dimensions.
         """
-        if xp.is_gpu(inslice) and self._allserial and self._localsize <= 4096:
-            from feectools.linalg.direct_solvers import BandedSolver, SparseSolver
+        temp1 = self._temp1
+        temp2 = self._temp2
 
-            host_factor_types = (BandedSolver, SparseSolver)
-            if all(type(solver) in host_factor_types for solver in self._solvers):
-                # Tiny tensor solves are latency-bound on the GPU: each of the
-                # three directions launches a small GEMM and two directions
-                # require a full tensor reorder. Stage once in each direction
-                # and execute the already-factorized banded solves on the host.
-                if not hasattr(self, '_host_temp1'):
-                    self._host_temp1 = np.empty((int(self._tempsize),), dtype=self._dtype)
-                    self._host_temp2 = np.empty((int(self._tempsize),), dtype=self._dtype)
-                    self._host_out = np.empty(tuple(int(n) for n in self._nlocals), dtype=self._dtype)
-                host_in = xp.to_numpy(inslice)
-                self._solve_nd_with_temps(
-                    host_in,
-                    self._host_out,
-                    self._host_temp1,
-                    self._host_temp2,
-                )
-                outslice[...] = xp.asarray(self._host_out)
-                return
-
-        self._solve_nd_with_temps(inslice, outslice, self._temp1, self._temp2)
-
-    def _solve_nd_with_temps(self, inslice, outslice, temp1, temp2):
-        """Internal Kronecker passes using caller-provided work arrays."""
         # copy input
         self._inslice_to_temp(inslice, temp1)
 
@@ -827,20 +793,20 @@ class KroneckerLinearSolver(LinearOperator):
             cartstart = cart.global_starts[i]
             cartsize = cartend - cartstart
 
-            # source MPI sizes and disps -- these are passed straight to
-            # mpi4py's Alltoallv as counts/displacements, which (like
-            # cart.global_starts/global_ends above) must be host int arrays
-            # regardless of backend; keep this whole computation on numpy.
+            # source MPI sizes and disps
+            # distribute the data like
+            # (N+1, N+1, ..., N+1, N, N, ...)
+            # where N = floor(mglobaldata / comm.size)
             mlocal_pre = mglobal // comm.size
             mlocal_add = mglobal % comm.size
-            sourcesizes = np.full((comm.size,), mlocal_pre, dtype=int)
+            sourcesizes = xp.full((comm.size,), mlocal_pre, dtype=int)
             sourcesizes[:mlocal_add] += 1
             mlocal = sourcesizes[comm.rank]
             sourcesizes *= nlocal
 
             # disps, created from the sizes
-            sourcedisps = np.zeros((comm.size+1,), dtype=int)
-            np.cumsum(sourcesizes, out=sourcedisps[1:])
+            sourcedisps = xp.zeros((comm.size+1,), dtype=int)
+            xp.cumsum(sourcesizes, out=sourcedisps[1:])
             sourcedisps = sourcedisps[:-1]
 
             # target MPI sizes and disps
